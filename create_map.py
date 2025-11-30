@@ -3,6 +3,7 @@ import folium
 from folium.plugins import HeatMap
 import pandas as pd
 import math
+import json
 
 
 def plot_all_points():
@@ -380,9 +381,274 @@ def plot_transport_comparison():
     print(f"   🔴 Red-Black: Poor public transport performance")
 
 
+def plot_all_points_with_districts():
+    """
+    Creates a map showing all public transport travel times with Warsaw district borders.
+    """
+    conn = sqlite3.connect('travel_info.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT latitude, longitude, transit_duration, street FROM travel_info')
+    data = cursor.fetchall()
+    conn.close()
+
+    m = folium.Map(location=[52.2297, 21.0122], zoom_start=12)
+
+    min_time_green = 10
+    mid_time_yellow = 25
+    mid_time_red = 40
+    max_time_black = 55
+    max_color_val = 204
+
+    for lat, lon, travel_time, address in data:
+        if travel_time is not None:
+            if travel_time < min_time_green:
+                color = '#0c0'
+            elif travel_time > max_time_black:
+                color = 'black'
+            elif travel_time > mid_time_red:
+                color_value = int((travel_time - mid_time_red) / (max_time_black - mid_time_red) * max_color_val)
+                color = f'#{max_color_val - color_value:02x}0000'
+            elif travel_time > mid_time_yellow:
+                color_value = int((travel_time - mid_time_yellow) / (mid_time_red - mid_time_yellow) * max_color_val)
+                color = f'#{max_color_val:02x}{max_color_val - color_value:02x}00'
+            else:
+                color_value = int((travel_time - min_time_green) / (mid_time_yellow - min_time_green) * max_color_val)
+                color = f'#{color_value:02x}{max_color_val:02x}00'
+        else:
+            color = 'gray'
+        label = f"Address: {address} ({travel_time if travel_time is not None else 'N/A'} min)"
+        folium.CircleMarker(location=[lat, lon], radius=4, color=color, fill=True, fill_opacity=0.7, popup=label).add_to(m)
+
+    # Load and add district borders on top
+    with open('warszawa-dzielnice.geojson', 'r', encoding='utf-8') as f:
+        geojson_data = json.load(f)
+
+    def district_style(feature):
+        return {
+            'fillColor': 'transparent',
+            'color': '#1e3a5f',
+            'weight': 2.5,
+            'fillOpacity': 0
+        }
+
+    folium.GeoJson(
+        geojson_data,
+        name='Warsaw Districts',
+        style_function=district_style,
+        tooltip=folium.GeoJsonTooltip(
+            fields=['name'],
+            aliases=['District:'],
+            style='background-color: white; color: #333; font-weight: bold;'
+        )
+    ).add_to(m)
+
+    folium.LayerControl().add_to(m)
+    m.save('static/public_transport_districts.html')
+    print("🗺️  Public transport with districts map saved to static/public_transport_districts.html")
+
+
+def plot_transport_comparison_with_districts():
+    """
+    Creates a map showing comparison between car and public transport times
+    with Warsaw district borders overlaid on top.
+    """
+    # Connect to the SQLite database
+    conn = sqlite3.connect('travel_info.db')
+    cursor = conn.cursor()
+
+    # Query to get data where both car and transit durations exist
+    cursor.execute('''
+        SELECT latitude, longitude, transit_duration, car_duration_avg, street
+        FROM travel_info
+        WHERE transit_duration IS NOT NULL
+        AND car_duration_avg IS NOT NULL
+    ''')
+    data = cursor.fetchall()
+    conn.close()
+
+    # Create a base map centered on Warsaw
+    m = folium.Map(location=[52.2297, 21.0122], zoom_start=12)
+
+    # Color palette thresholds (difference = transit_time - car_time)
+    thresholds = {
+        'excellent': 0,      # Public transport faster (green)
+        'good': 10,         # Slightly slower (0-10 min) (light green)
+        'acceptable': 15,   # Moderate difference (10-15 min) (amber)
+        'poor': 20,         # Significant difference (15-20 min) (orange)
+        'very_poor': 100    # Very poor (20+ min) (red to black)
+    }
+
+    # Creative color palette inspired by Warsaw nature and urban themes
+    colors = {
+        'excellent': '#006837',     # Deep forest green (Łazienki Park)
+        'good': '#31a354',          # Sage green (Vistula riverbank)
+        'acceptable': '#feb24c',     # Warm amber (Warsaw sunset)
+        'poor': '#fd8d3c',          # Sunset orange
+        'very_poor': '#bd0026',     # Deep crimson (Palace of Culture red brick)
+        'extreme': '#000000'        # Black (coal/industry)
+    }
+
+    def get_color(time_diff):
+        """Get color based on time difference (transit - car)"""
+        if time_diff < thresholds['excellent']:
+            return colors['excellent']
+        elif time_diff < thresholds['good']:
+            ratio = time_diff / thresholds['good']
+            return interpolate_color(colors['excellent'], colors['good'], ratio)
+        elif time_diff < thresholds['acceptable']:
+            ratio = (time_diff - thresholds['good']) / (thresholds['acceptable'] - thresholds['good'])
+            return interpolate_color(colors['good'], colors['acceptable'], ratio)
+        elif time_diff < thresholds['poor']:
+            ratio = (time_diff - thresholds['acceptable']) / (thresholds['poor'] - thresholds['acceptable'])
+            return interpolate_color(colors['acceptable'], colors['poor'], ratio)
+        elif time_diff < thresholds['very_poor']:
+            ratio = (time_diff - thresholds['poor']) / (thresholds['very_poor'] - thresholds['poor'])
+            return interpolate_color(colors['poor'], colors['very_poor'], ratio)
+        else:
+            ratio = min(1.0, (time_diff - 20) / 20)
+            return interpolate_color(colors['very_poor'], colors['extreme'], ratio)
+
+    def interpolate_color(color1, color2, ratio):
+        """Interpolate between two hex colors"""
+        r1, g1, b1 = int(color1[1:3], 16), int(color1[3:5], 16), int(color1[5:7], 16)
+        r2, g2, b2 = int(color2[1:3], 16), int(color2[3:5], 16), int(color2[5:7], 16)
+        r = int(r1 + (r2 - r1) * ratio)
+        g = int(g1 + (g2 - g1) * ratio)
+        b = int(b1 + (b2 - b1) * ratio)
+        return f'#{r:02x}{g:02x}{b:02x}'
+
+    def get_status_text(time_diff):
+        """Get descriptive text for the time difference"""
+        if time_diff < 0:
+            return f"🚊 Public transport faster by {abs(time_diff):.1f} min"
+        elif time_diff < 10:
+            return f"🚊 Public transport slightly slower by {time_diff:.1f} min"
+        elif time_diff < 15:
+            return f"🚗 Car moderately faster by {time_diff:.1f} min"
+        elif time_diff < 20:
+            return f"🚗 Car significantly faster by {time_diff:.1f} min"
+        else:
+            return f"🚗 Car much faster by {time_diff:.1f} min"
+
+    # Plot points on the map
+    for lat, lon, transit_time, car_time, address in data:
+        time_diff = transit_time - car_time
+        color = get_color(time_diff)
+        status = get_status_text(time_diff)
+
+        popup_text = f"""
+        <b>{address}</b><br>
+        🚊 Public transport: {transit_time:.1f} min<br>
+        🚗 Car: {car_time:.1f} min<br>
+        <b>{status}</b>
+        """
+
+        radius = min(12, max(6, 6 + abs(time_diff) / 8))
+
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=radius,
+            weight=0,
+            fill=True,
+            fillColor=color,
+            fillOpacity=0.9,
+            popup=folium.Popup(popup_text, max_width=300)
+        ).add_to(m)
+
+    # Load and add district borders on top
+    with open('warszawa-dzielnice.geojson', 'r', encoding='utf-8') as f:
+        geojson_data = json.load(f)
+
+    def district_style(feature):
+        return {
+            'fillColor': 'transparent',
+            'color': '#1e3a5f',  # Dark blue border
+            'weight': 2.5,
+            'fillOpacity': 0
+        }
+
+    folium.GeoJson(
+        geojson_data,
+        name='Warsaw Districts',
+        style_function=district_style,
+        tooltip=folium.GeoJsonTooltip(
+            fields=['name'],
+            aliases=['District:'],
+            style='background-color: white; color: #333; font-weight: bold;'
+        )
+    ).add_to(m)
+
+    # Add a legend
+    legend_html = f'''
+    <div style="position: fixed;
+                bottom: 50px; left: 50px; width: 200px; height: 180px;
+                background-color: white; border:2px solid grey; z-index:9999;
+                font-size:14px; padding: 10px">
+    <p><b>Transport Comparison</b></p>
+    <p><i class="fa fa-circle" style="color:{colors['excellent']}"></i> Public transport faster</p>
+    <p><i class="fa fa-circle" style="color:{colors['good']}"></i> Slightly slower (0-10 min)</p>
+    <p><i class="fa fa-circle" style="color:{colors['acceptable']}"></i> Moderate difference (10-15 min)</p>
+    <p><i class="fa fa-circle" style="color:{colors['poor']}"></i> Significant difference (15-20 min)</p>
+    <p><i class="fa fa-circle" style="color:{colors['very_poor']}"></i> Very poor (20+ min)</p>
+    </div>
+    '''
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    # Add layer control
+    folium.LayerControl().add_to(m)
+
+    # Save the map
+    m.save('static/transport_comparison_districts.html')
+    print("🗺️  Transport comparison with districts map saved to static/transport_comparison_districts.html")
+
+
+def plot_warsaw_districts():
+    """
+    Creates a map showing Warsaw districts with their borders drawn.
+    Uses the warszawa-dzielnice.geojson file.
+    """
+    # Create a base map centered on Warsaw
+    m = folium.Map(location=[52.2297, 21.0122], zoom_start=11)
+
+    # Load GeoJSON file
+    with open('warszawa-dzielnice.geojson', 'r', encoding='utf-8') as f:
+        geojson_data = json.load(f)
+
+    # Style function for district borders
+    def style_function(feature):
+        return {
+            'fillColor': 'transparent',
+            'color': '#2563eb',  # Blue border color
+            'weight': 2,
+            'fillOpacity': 0.1
+        }
+
+    # Add GeoJSON layer with district borders
+    folium.GeoJson(
+        geojson_data,
+        name='Warsaw Districts',
+        style_function=style_function,
+        tooltip=folium.GeoJsonTooltip(
+            fields=['name'],
+            aliases=['District:'],
+            style='background-color: white; color: #333; font-weight: bold;'
+        )
+    ).add_to(m)
+
+    # Add layer control
+    folium.LayerControl().add_to(m)
+
+    # Save the map
+    m.save('static/warsaw_districts.html')
+    print("🗺️  Warsaw districts map saved to static/warsaw_districts.html")
+
+
 # Call the functions
 plot_all_points()
 plot_points_short_time()
 plot_heatmap_with_metro_stations()
 plot_transport_comparison()
 plot_transfer_analysis()
+plot_warsaw_districts()
+plot_all_points_with_districts()
+plot_transport_comparison_with_districts()
